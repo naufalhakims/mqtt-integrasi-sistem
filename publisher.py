@@ -8,6 +8,7 @@ import ssl
 import uuid
 import json
 import threading
+import signal # Pastikan signal diimport
 
 # --- Konfigurasi Umum (UNTUK HIVEMQ CLOUD) ---
 BROKER_ADDRESS = "2a4b87c12f234df1adead04ea3a95c23.s1.eu.hivemq.cloud"  # GANTI DENGAN URL CLUSTER ANDA
@@ -15,10 +16,27 @@ PORT_MQTTS = 8883
 USERNAME = "naufalhakim"  # GANTI DENGAN USERNAME ANDA
 PASSWORD = "Insis123"  # GANTI DENGAN PASSWORD ANDA
 
+# --- Global variables untuk graceful shutdown ---
+running = True  # Variabel global untuk mengontrol loop utama publisher
+publisher_client_id_global = f"python-publisher-{uuid.uuid4()}"
+publisher_ping_counter = 0
+
 # --- State untuk Request/Response dari Publisher ---
 publisher_pending_responses = {}
 publisher_response_events = {}
 publisher_client_id_global = f"python-publisher-{uuid.uuid4()}" # Global agar bisa diakses untuk response topic
+
+# Signal handler untuk publisher
+def publisher_signal_handler(sig, frame):
+    global running
+    # Dapatkan nama sinyal untuk logging yang lebih informatif
+    signal_name = signal.Signals(sig).name if isinstance(sig, signal.Signals) else str(sig)
+    print(f'\n🚨 Publisher ({publisher_client_id_global}) menerima sinyal shutdown ({signal_name})...')
+    running = False
+
+# Daftarkan signal handlers untuk publisher
+signal.signal(signal.SIGINT, publisher_signal_handler)
+signal.signal(signal.SIGTERM, publisher_signal_handler)
 
 # --- Callback Functions ---
 def on_subscribe_publisher(client, userdata, mid, reason_codes_list, properties=None):
@@ -143,7 +161,7 @@ def on_message_publisher(client, userdata, msg):
     # 4. Handle PING dari Subscriber (Publisher merespons dengan PONG)
     elif msg.topic == "ping/sub_to_pub": # <<< TAMBAHKAN LOGIKA INI
         print(f"   🏓 PING diterima dari subscriber: {payload_str}")
-        pong_payload = f"PONG_FROM_PUBLISHER_{publisher_client_id_global}_TO_PING_ON_{msg.topic}"
+        pong_payload = "PONG_FROM_PUBLISHER"
         # Kirim PONG ke topik yang didengarkan subscriber untuk PONG
         client.publish("pong/pub_to_sub", payload=pong_payload, qos=1) # <<< GANTI NAMA TOPIK TUJUAN PONG
         print(f"   📤 PONG (balasan PING subscriber) dikirim ke 'pong/pub_to_sub'")
@@ -212,37 +230,32 @@ def send_request_from_publisher(client, request_payload_dict, request_topic, qos
 
 
 def run_publisher():
-    global publisher_client_id_global
-    
+    global running  # Pastikan 'running' diakses sebagai global
+    global publisher_client_id_global, publisher_ping_counter # 'running' sudah global di level modul
+
     publisher = mqtt.Client(
         callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
         client_id=publisher_client_id_global,
         protocol=mqtt.MQTTv5
     )
 
+    # ... (setup username_pw_set, callbacks, LWT, tls_set_context tetap sama) ...
     publisher.username_pw_set(USERNAME, PASSWORD)
     publisher.on_connect = on_connect
-    publisher.on_subscribe = on_subscribe_publisher # DAFTARKAN CALLBACK BARU
+    publisher.on_subscribe = on_subscribe_publisher 
     publisher.on_disconnect = on_disconnect
-    publisher.on_publish = on_publish # Gunakan on_publish yang sudah dimodifikasi sebelumnya
+    publisher.on_publish = on_publish 
     publisher.on_message = on_message_publisher
     publisher.on_log = on_log
 
-    # --- Last Will and Testament (LWT) ---
     lwt_topic = "status/publisher/lastwill"
     lwt_payload = json.dumps({"id": publisher_client_id_global, "status": "offline_unexpectedly", "time": time.time()})
-    
     lwt_props = mqtt_props.Properties(mqtt_packettypes.PacketTypes.WILLMESSAGE)
-    lwt_props.MessageExpiryInterval = 3600  # LWT message valid selama 1 jam
-    lwt_props.WillDelayInterval = 5 # Tunda pengiriman LWT selama 5 detik setelah disconnect
+    lwt_props.MessageExpiryInterval = 3600
+    lwt_props.WillDelayInterval = 5
     lwt_props.UserProperty = [("source", "LWT-Publisher-Full"), ("priority", "high")]
-
     publisher.will_set(
-        lwt_topic,
-        payload=lwt_payload,
-        qos=1,
-        retain=False, # LWT biasanya tidak di-retain, tapi bisa jika state terakhir penting
-        properties=lwt_props
+        lwt_topic, payload=lwt_payload, qos=1, retain=False, properties=lwt_props
     )
     print(f"📜 Last Will and Testament diatur ke topik: {lwt_topic}")
 
@@ -263,14 +276,18 @@ def run_publisher():
         print(f"💥 Publisher Gagal terhubung ke broker: {e}")
         return
 
-    publisher.loop_start() # Jalankan loop di background thread
+    publisher.loop_start()
 
-    # Tunggu koneksi stabil
     print("⏳ Menunggu koneksi publisher stabil...")
-    time.sleep(3) # Beri waktu untuk callback on_connect dan subscribe selesai
+    time.sleep(3) 
 
-    if not publisher.is_connected():
+    if not publisher.is_connected() and running: # Tambahkan cek 'running'
         print("❌ Publisher tidak dapat terhubung. Keluar.")
+        publisher.loop_stop()
+        return
+    elif not running: # Jika sinyal shutdown diterima saat menunggu koneksi
+        print("Publisher dihentikan saat menunggu koneksi.")
+        if publisher.is_connected(): publisher.disconnect()
         publisher.loop_stop()
         return
     
@@ -278,82 +295,106 @@ def run_publisher():
     print("🚀 PUBLISHER SIAP MELAKUKAN SEMUA AKSI 🚀")
     print("="*40 + "\n")
 
+    last_ping_time = 0 # Inisialisasi agar PING pertama langsung dikirim
+    ping_interval = 5 
+
     try:
-        # 1. --- QoS (Quality of Service) ---
-        print("\n=== 1. Testing QoS 0, 1, dan 2 ===")
-        topic_qos = "sensor/data_qos"
-        publisher.publish(topic_qos, payload=json.dumps({"temp": 25.0, "qos_test": "QoS 0"}), qos=0)
-        time.sleep(0.5)
-        msg_info_qos1 = publisher.publish(topic_qos, payload=json.dumps({"temp": 25.5, "qos_test": "QoS 1"}), qos=1)
-        # msg_info_qos1.wait_for_publish(timeout=5)
-        time.sleep(0.5)
-        msg_info_qos2 = publisher.publish(topic_qos, payload=json.dumps({"temp": 26.0, "qos_test": "QoS 2"}), qos=2)
-        # msg_info_qos2.wait_for_publish(timeout=5)
-        print("   Pesan QoS 0, 1, 2 telah dikirim.")
-        time.sleep(1)
-
-        # 2. --- Retained Message ---
-        print("\n=== 2. Testing Retained Message ===")
-        topic_retained = "config/device/static_info"
-        retained_payload = json.dumps({"firmware_version": "1.2.3", "serial_number": "SN-PUBLISHER-001"})
-        publisher.publish(topic_retained, payload=retained_payload, qos=1, retain=True)
-        print(f"   Retained message dikirim ke '{topic_retained}'.")
-        time.sleep(1)
-        # Untuk menguji, subscriber baru yang connect dan subscribe ke topik ini akan langsung dapat pesan ini.
-        # Untuk menghapus retained message: publish pesan kosong (payload="") dengan flag retain=True ke topik yang sama.
-        # publisher.publish(topic_retained, payload="", qos=1, retain=True)
-        # print(f"   Retained message di '{topic_retained}' telah dihapus (jika diperlukan).")
-
-        # 3. --- Message Expiry (MQTT v5) ---
-        print("\n=== 3. Testing Message Expiry ===")
-        topic_expiry = "notifications/temporary_alert"
-        expiry_props = mqtt_props.Properties(mqtt_packettypes.PacketTypes.PUBLISH)
-        expiry_props.MessageExpiryInterval = 15  # Pesan valid selama 15 detik di broker
-        expiry_props.UserProperty = [("alert_level", "medium")]
-        publisher.publish(
-            topic_expiry,
-            payload=json.dumps({"alert": "Suhu server kritis sementara!", "details": "Akan hilang dalam 15s jika tidak ada subscriber online"}),
-            qos=1,
-            properties=expiry_props
-        )
-        print(f"   Pesan dengan expiry 15 detik dikirim ke '{topic_expiry}'.")
-        time.sleep(1)
-
-        # 4. --- Request/Response Pattern (Publisher sebagai Requester) ---
-        print("\n=== 4. Testing Request/Response (Publisher -> Subscriber) ===")
-        request_payload_pub = {"command": "get_device_status", "device_id": "SENSOR_SUHU_001"}
-        send_request_from_publisher(publisher, request_payload_pub, "actions/device/get_status", qos=1, timeout=10)
-        time.sleep(1)
-
-        # 5. --- Ping-Pong Pattern (Publisher mengirim PING) ---
-        print("\n=== 5. Testing Ping-Pong (Publisher mengirim PING ke Subscriber) ===")
-        ping_payload_pub = f"PING_FROM_PUBLISHER_{publisher_client_id_global}_{int(time.time())}"
-        publisher.publish("ping/pub_to_sub", payload=ping_payload_pub, qos=1) # <<< GANTI NAMA TOPIK
-        print(f"   PING dikirim: {ping_payload_pub} ke 'ping/pub_to_sub'. Menunggu PONG...")
-        # Beri waktu subscriber merespon PONG, akan terlihat di on_message_publisher
-        # Tidak perlu time.sleep(5) yang memblokir di sini, karena PONG akan diterima secara async.
-        
-        print("\n=== SEMUA AKSI PUBLISHER AWAL TELAH DILAKUKAN ===")
-        print("Publisher akan tetap berjalan untuk menerima PING/response atau request dari subscriber.")
-        
-        # Biarkan publisher tetap berjalan untuk menerima request dari subscriber
-        while True:
+        # --- Aksi Awal Publisher (dikirim sekali) ---
+        if running: # Hanya lakukan aksi awal jika masih 'running'
+            print("\n=== 1. Testing QoS 0, 1, dan 2 ===")
+            # ... (kode publish QoS seperti sebelumnya) ...
+            topic_qos = "sensor/data_qos"
+            publisher.publish(topic_qos, payload=json.dumps({"msg": "QoS 0 test"}), qos=0)
+            time.sleep(0.5)
+            if not running: raise KeyboardInterrupt # Cek flag setelah sleep
+            publisher.publish(topic_qos, payload=json.dumps({"msg": "QoS 1 test"}), qos=1)
+            time.sleep(0.5)
+            if not running: raise KeyboardInterrupt
+            publisher.publish(topic_qos, payload=json.dumps({"msg": "QoS 2 test"}), qos=2)
+            print("   Pesan QoS 0, 1, 2 telah dikirim.")
             time.sleep(1)
+            if not running: raise KeyboardInterrupt
 
-    except KeyboardInterrupt:
-        print("\nℹ️ Publisher dihentikan oleh pengguna.")
+            print("\n=== 2. Testing Retained Message ===")
+            # ... (kode publish Retained seperti sebelumnya) ...
+            topic_retained = "config/device/static_info"
+            retained_payload = json.dumps({"fw_version": "1.2.3", "sn": "SN_PUB_001"})
+            publisher.publish(topic_retained, payload=retained_payload, qos=1, retain=True)
+            print(f"   Retained message dikirim ke '{topic_retained}'.")
+            time.sleep(1)
+            if not running: raise KeyboardInterrupt
+
+            print("\n=== 3. Testing Message Expiry ===")
+            # ... (kode publish Expiry seperti sebelumnya) ...
+            topic_expiry = "notifications/temporary_alert"
+            expiry_props = mqtt_props.Properties(mqtt_packettypes.PacketTypes.PUBLISH)
+            expiry_props.MessageExpiryInterval = 15
+            publisher.publish(
+                topic_expiry,
+                payload=json.dumps({"alert_msg": "Temporary critical alert!"}),
+                qos=1,
+                properties=expiry_props
+            )
+            print(f"   Pesan dengan expiry 15 detik dikirim ke '{topic_expiry}'.")
+            time.sleep(1)
+            if not running: raise KeyboardInterrupt
+
+            print("\n=== 4. Testing Request/Response (Publisher -> Subscriber) ===")
+            # ... (kode panggil send_request_from_publisher seperti sebelumnya) ...
+            request_payload_pub = {"cmd": "get_status", "id": "SENSOR_001"}
+            send_request_from_publisher(publisher, request_payload_pub, "actions/device/get_status", qos=1, timeout=10)
+            time.sleep(1) # Jeda sebelum loop periodik PING
+            if not running: raise KeyboardInterrupt
+
+
+        print("\n=== AKSI AWAL PUBLISHER TELAH DILAKUKAN (jika berjalan) ===")
+        print("Publisher akan mulai mengirim PING periodik dan tetap berjalan...")
+        print("Tekan Ctrl+C untuk menghentikan.")
+        
+        # Loop utama publisher untuk PING periodik
+        # Variabel 'running' di sini akan merujuk ke 'running' global di level modul
+        while running: 
+            current_time = time.time()
+            if publisher.is_connected() and (current_time - last_ping_time > ping_interval):
+                publisher_ping_counter += 1
+                ping_payload = f"PING_DARI_PUBLISHER_KE_{publisher_ping_counter}"
+
+                print(f"\n📡 Publisher mengirim PING Periodik #{publisher_ping_counter}: {ping_payload}")
+                ping_result = publisher.publish("ping/pub_to_sub", payload=ping_payload, qos=1)
+                if ping_result.rc != mqtt.MQTT_ERR_SUCCESS:
+                    print(f"   ⚠️ Gagal mengirim PING periodik (RC: {ping_result.rc})")
+                last_ping_time = current_time
+            
+            # Loop ini harus memiliki sleep agar tidak memakan CPU 100%
+            # Dan juga agar loop network Paho mendapatkan kesempatan berjalan
+            for _ in range(10): # Cek 'running' lebih sering
+                if not running:
+                    break
+                time.sleep(0.1)
+            if not running:
+                break
+        
+        if not running:
+            print("Loop utama publisher dihentikan karena flag 'running' False.")
+
+    # except KeyboardInterrupt:
+    #     # Ini kemungkinan besar tidak akan tercapai jika signal_handler bekerja dengan baik
+    #     # dan mengatur 'running' ke False, menyebabkan loop while berhenti secara alami.
+    #     print("\nℹ️ Publisher dihentikan oleh pengguna (KeyboardInterrupt terdeteksi di try-except).")
+    #     # 'running' sudah diatur False oleh signal_handler
     except Exception as e:
         print(f"💥 Error di loop utama publisher: {e}")
+        # Tidak perlu 'global running' di sini, signal_handler yang utama
+        # Cukup pastikan loop berhenti jika ada error tak terduga
+        # Untuk memastikan assignment di bawah ini menarget global
+        running = False # Hentikan loop jika ada error lain
     finally:
         print("\n🔌 Membersihkan publisher...")
         if publisher.is_connected():
-            # Kirim pesan normal disconnect jika perlu (sebagai contoh)
-            # disconnect_props = mqtt_props.Properties(mqtt_packettypes.PacketTypes.DISCONNECT)
-            # disconnect_props.ReasonString = "Publisher shutting down normally"
-            # publisher.disconnect(properties=disconnect_props)
-            publisher.disconnect() # Disconnect standar
-        publisher.loop_stop() # Pastikan loop network dihentikan
+            publisher.disconnect()
+        publisher.loop_stop() 
         print("✅ Publisher berhenti.")
 
+# if __name__ == "__main__": tetap sama
 if __name__ == "__main__":
     run_publisher()
