@@ -279,8 +279,8 @@ def handle_ping_from_publisher(client, ping_payload, original_ping_topic):
     """Merespon PING dari publisher dengan PONG."""
     # Kirim PONG ke topik yang didengarkan publisher untuk PONG
     pong_topic_target = "pong/sub_to_pub" # <<< GANTI NAMA TOPIK
-    pong_payload = f"PONG_FROM_SUBSCRIBER_{subscriber_client_id_global}_TO_PING_ON_{original_ping_topic}"
-    
+    pong_payload = "PONG_FROM_SUBSCRIBER"
+
     result = client.publish(pong_topic_target, payload=pong_payload, qos=1)
     if result.rc == mqtt.MQTT_ERR_SUCCESS:
         print(f"   📤 PONG (balasan PING publisher) dikirim ke '{pong_topic_target}'")
@@ -379,24 +379,24 @@ def run_subscriber():
 
     # Contoh: Subscriber mengirim request ke publisher setelah beberapa saat
     # Ini akan dijalankan dalam thread agar tidak memblokir loop utama check_message_queue
-    def delayed_subscriber_actions():
-        time.sleep(10) 
-        if running and subscriber_client_global.is_connected():
-            print("\n=== Subscriber akan mengirimkan request ke Publisher ===")
-            req_payload = {"component": "all", "requester_id": subscriber_client_id_global}
-            send_request_from_subscriber(subscriber_client_global, req_payload, "actions/system/get_info")
+    # def delayed_subscriber_actions():
+    #     time.sleep(10) 
+    #     if running and subscriber_client_global.is_connected():
+    #         print("\n=== Subscriber akan mengirimkan request ke Publisher ===")
+    #         req_payload = {"component": "all", "requester_id": subscriber_client_id_global}
+    #         send_request_from_subscriber(subscriber_client_global, req_payload, "actions/system/get_info")
 
-            time.sleep(5) # Jeda sebelum PING
-            print("\n=== Subscriber akan mengirimkan PING ke Publisher ===")
-            ping_payload_sub = f"PING_FROM_SUBSCRIBER_{subscriber_client_id_global}_{int(time.time())}"
-            # Kirim PING ke topik yang didengarkan Publisher untuk PING dari Subscriber
-            subscriber_client_global.publish("ping/sub_to_pub", payload=ping_payload_sub, qos=1) # <<< GANTI NAMA TOPIK
-            print(f"   PING dari subscriber dikirim: {ping_payload_sub} ke 'ping/sub_to_pub'. Menunggu PONG...")
-            # PONG akan diterima di on_message -> process_message_thread
+    #         time.sleep(5) # Jeda sebelum PING
+    #         print("\n=== Subscriber akan mengirimkan PING ke Publisher ===")
+    #         ping_payload_sub = "PING_FROM_SUBSCRIBER"
+    #         # Kirim PING ke topik yang didengarkan Publisher untuk PING dari Subscriber
+    #         subscriber_client_global.publish("ping/sub_to_pub", payload=ping_payload_sub, qos=1) # <<< GANTI NAMA TOPIK
+    #         print(f"   PING dari subscriber dikirim: {ping_payload_sub} ke 'ping/sub_to_pub'. Menunggu PONG...")
+    #         # PONG akan diterima di on_message -> process_message_thread
 
-    action_thread = threading.Thread(target=delayed_subscriber_actions)
-    action_thread.daemon = True
-    action_thread.start()
+    # action_thread = threading.Thread(target=delayed_subscriber_actions)
+    # action_thread.daemon = True
+    # action_thread.start()
 
     try:
         while running:
